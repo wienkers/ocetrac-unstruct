@@ -1,7 +1,7 @@
 import xarray as xr
 import numpy as np
 import scipy.ndimage
-from skimage.measure import regionprops 
+from skimage.measure import regionprops_table 
 from skimage.measure import label as label_np
 import dask.array as dsa
 
@@ -199,12 +199,13 @@ class Tracker:
         labels_wrapped, N_initial = self._wrap(labels)
 
         # Calculate Area of each object and keep objects larger than threshold
-        props = regionprops(labels_wrapped.astype('int'))
+        props = regionprops_table(labels_wrapped.values.astype('int'), properties=['label', 'area'])
         
-        labelprops = [p.label for p in props]
+        labelprops = props['label']
         labelprops = xr.DataArray(labelprops, dims=['label'], coords={'label': labelprops}) 
         
-        area = xr.DataArray([p.area for p in props], dims=['label'], coords={'label': labelprops})  # Number of pixels of the region.
+        area = props['area']
+        area = xr.DataArray(area, dims=['label'], coords={'label': labelprops}) 
 
         if area.size == 0:
             raise ValueError(f'No objects were detected. Try changing radius or min_size_quartile parameters.')
@@ -214,7 +215,7 @@ class Tracker:
         
         keep_labels = labelprops.where(area>=min_area, drop=True)
         keep_where = np.isin(labels_wrapped, keep_labels)
-        out_labels = xr.DataArray(np.where(keep_where==False, 0, labels_wrapped), dims=binary_images.dims, coords=binary_images.coords)
+        out_labels = xr.DataArray(np.where(keep_where==False, 0, labels_wrapped), dims=binary_images.dims, coords=binary_images.coords).chunk(binary_images.chunks)
 
         # Convert images to binary. All positive values == 1, otherwise == 0
         binary_labels = out_labels.where(out_labels==0, drop=False, other=1)
@@ -273,16 +274,19 @@ class Tracker:
 
         def inverse_unique(labels):
     
-            unique_values = dsa.unique(labels.data)   # .data makes this a dask array (not xarray!)
+            labels_dask = labels.data
+
+            unique_values = dsa.unique(labels_dask)   # .data makes this a dask array (not xarray!)
             
             # Map blocks to indices
             def map_to_indices(block, unique_values):
                 return np.searchsorted(unique_values, block)
             
             # Compute the inverse indices
-            inverse_indices = dsa.map_blocks(map_to_indices, labels, unique_values, 
-                                        dtype=int, chunks=labels.chunks,
-                                        new_axis=None).reshape(labels.shape)
+            inverse_indices = dsa.map_blocks(map_to_indices, labels_dask, unique_values, 
+                                        dtype=int, chunks=labels_dask.chunks)
+            
+            inverse_indices = inverse_indices.reshape(labels.shape)
             
             # Convert back to DataArray, preserving the original coordinates and attributes
             inverse_indices_da = xr.DataArray(inverse_indices, coords=labels.coords, dims=labels.dims, attrs=labels.attrs)
@@ -291,8 +295,8 @@ class Tracker:
         
         # temp_dask = dsa.unique(labels_wrapped.data, return_inverse=True)[1].reshape(labels_wrapped.shape)
         # labels_wrapped_unique = xr.DataArray(temp_dask, coords=labels_wrapped.coords, dims=labels_wrapped.dims, attrs=labels_wrapped.attrs)  
-        labels_wrapped_unique = inverse_unique(labels_wrapped).persist()  #(?)
-         
+        labels_wrapped_unique = inverse_unique(labels_wrapped)  #(?)
+        
 
         # Recalculate the total number of labels 
         N = labels_wrapped_unique.max() #np.max(labels_wrapped_unique)
