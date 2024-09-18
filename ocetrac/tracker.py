@@ -191,11 +191,12 @@ class Tracker:
         labels = labels.where(labels>0, drop=False, other=np.nan)  
 
         # The labels are repeated each time step, therefore we relabel them to be consecutive
-        for i in range(1, labels.shape[0]):
-            labels[i,:,:] = labels[i,:,:].values + labels[i-1,:,:].max().values
+        # This is embarrasingly parallel in time, so this removes the serialising time dependence...
+        cumulative_max = labels.max(dim={self.xdim,self.ydim}).cumsum(dim=self.timedim)
+        labels = labels + cumulative_max.shift({self.timedim: 1}, fill_value=0)
 
         labels = labels.where(labels>0, drop=False, other=0)  
-        labels_wrapped, N_initial = self._wrap(np.array(labels))
+        labels_wrapped, N_initial = self._wrap(labels)
 
         # Calculate Area of each object and keep objects larger than threshold
         props = regionprops(labels_wrapped.astype('int'))
@@ -239,25 +240,62 @@ class Tracker:
 
 
     def _wrap(self, labels):
-        ''' Impose periodic boundary and wrap labels'''
-        first_column = labels[..., 0]
-        last_column = labels[..., -1]
+        ''' Impose periodic boundary and wrap labels... daskified'''
+        
+        ## This is embarrasingly parallel in time, so we can use dask to avoid the task dependencies...
+                
+        # Wrap the wrap wrapper 
+        def wrap_x(labels):  # Should be vectorised -- i.e. working on numpy arrays
+            labels_wrapped = labels.copy() # input is immutable from dask ufunc...
+            first_column = labels[:, 0]  # all of y, first x
+            last_column = labels[:, -1]
+            unique_first = np.unique(first_column[first_column>0])
+            
+            for value in unique_first:
+                first = np.where(first_column == value)[0]  # all are 1d now... select just the first index of the tuple
+                last = last_column[first]
+                bad_labels = np.unique(last[last>0])
+                replace = np.isin(labels, bad_labels)
+                if replace.size == 0:
+                    continue
+                
+                labels_wrapped[replace] = value
+            
+            return labels_wrapped
+        
+        
+        labels_wrapped = xr.apply_ufunc(wrap_x, labels,
+                                input_core_dims=[[self.ydim, self.xdim]],
+                                output_core_dims=[[self.ydim, self.xdim]],
+                                output_dtypes=[labels.dtype],
+                                vectorize=True,
+                                dask='parallelized')
 
-        unique_first = np.unique(first_column[first_column>0])
+        def inverse_unique(labels):
+    
+            unique_values = dsa.unique(labels.data)   # .data makes this a dask array (not xarray!)
+            
+            # Map blocks to indices
+            def map_to_indices(block, unique_values):
+                return np.searchsorted(unique_values, block)
+            
+            # Compute the inverse indices
+            inverse_indices = dsa.map_blocks(map_to_indices, labels, unique_values, 
+                                        dtype=int, chunks=labels.chunks,
+                                        new_axis=None).reshape(labels.shape)
+            
+            # Convert back to DataArray, preserving the original coordinates and attributes
+            inverse_indices_da = xr.DataArray(inverse_indices, coords=labels.coords, dims=labels.dims, attrs=labels.attrs)
+            
+            return inverse_indices_da
+        
+        # temp_dask = dsa.unique(labels_wrapped.data, return_inverse=True)[1].reshape(labels_wrapped.shape)
+        # labels_wrapped_unique = xr.DataArray(temp_dask, coords=labels_wrapped.coords, dims=labels_wrapped.dims, attrs=labels_wrapped.attrs)  
+        labels_wrapped_unique = inverse_unique(labels_wrapped).persist()  #(?)
+         
 
-        # This loop iterates over the unique values in the first column, finds the location of those values in 
-        # the first columnm and then uses that index to replace the values in the last column with the first column value
-        for i in enumerate(unique_first):
-            first = np.where(first_column == i[1])
-            last = last_column[first[0], first[1]]
-            bad_labels = np.unique(last[last>0])
-            replace = np.isin(labels, bad_labels)
-            labels[replace] = i[1]
+        # Recalculate the total number of labels 
+        N = labels_wrapped_unique.max() #np.max(labels_wrapped_unique)
 
-        labels_wrapped = np.unique(labels, return_inverse=True)[1].reshape(labels.shape)
-
-        # recalculate the total number of labels 
-        N = np.max(labels_wrapped)
-
-        return labels_wrapped, N
+        return labels_wrapped_unique, N
 
