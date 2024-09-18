@@ -80,8 +80,9 @@ class Tracker:
         area, min_area, binary_labels, N_initial = self._filter_area(binary_images_with_mask)
 
         # Label objects
-        labels, num = self._label_either(binary_labels, return_num= True, connectivity=3)
-
+        labels = self._label_either(binary_labels, connectivity=3)
+        labels = xr.DataArray(labels, dims=binary_labels.dims, coords=binary_labels.coords).chunk(binary_images_with_mask.chunks)
+        
         # Wrap labels
         grid_res = abs(self.da[self.xdim][1]-self.da[self.xdim][0])
         if self.da[self.xdim][-1]-self.da[self.xdim][0] >= 360-grid_res:
@@ -215,7 +216,7 @@ class Tracker:
         
         keep_labels = labelprops.where(area>=min_area, drop=True)
         keep_where = np.isin(labels_wrapped, keep_labels)
-        out_labels = xr.DataArray(np.where(keep_where==False, 0, labels_wrapped), dims=binary_images.dims, coords=binary_images.coords).chunk(binary_images.chunks)
+        out_labels = xr.DataArray(np.where(keep_where==False, 0, labels_wrapped), dims=binary_images.dims, coords=binary_images.coords) #.chunk(binary_images.chunks)
 
         # Convert images to binary. All positive values == 1, otherwise == 0
         binary_labels = out_labels.where(out_labels==0, drop=False, other=1)
