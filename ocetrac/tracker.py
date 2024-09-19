@@ -79,18 +79,19 @@ class Tracker:
         # Filter area
         area, min_area, binary_labels, N_initial = self._filter_area(binary_images_with_mask)
 
-        # Label objects
-        labels = self._label_either(binary_labels, connectivity=3)
-        labels = xr.DataArray(labels, dims=binary_labels.dims, coords=binary_labels.coords).chunk(binary_images_with_mask.chunks)
+        # Label objects (_and_ when using dask_image, it can additionally wrap!)
+        labels_wrapped = self._label_either(binary_labels.data, structure=np.ones((3,3,3)), wrap_axes=(0,))
+        labels_wrapped = xr.DataArray(labels_wrapped, dims=binary_labels.dims, coords=binary_labels.coords).chunk(binary_images_with_mask.chunks)
         
-        # Wrap labels
-        grid_res = abs(self.da[self.xdim][1]-self.da[self.xdim][0])
-        if self.da[self.xdim][-1]-self.da[self.xdim][0] >= 360-grid_res:
-            labels_wrapped, N_final = self._wrap(labels)
-        else:
-            labels_wrapped = labels
-            N_final = np.max(labels)
-                
+        # # Wrap labels
+        # grid_res = abs(self.da[self.xdim][1]-self.da[self.xdim][0])
+        # if self.da[self.xdim][-1]-self.da[self.xdim][0] >= 360-grid_res:
+        #     labels_wrapped, N_final = self._wrap(labels)
+        # else:
+        #     labels_wrapped = labels
+        #     N_final = np.max(labels)
+        N_final = labels_wrapped.max()
+        
 
         # Final labels to DataArray
         new_labels = xr.DataArray(labels_wrapped, dims=self.da.dims, coords=self.da.coords)   
@@ -100,14 +101,14 @@ class Tracker:
         ## Metadata
 
         # Calculate Percent of total object area retained after size filtering
-        sum_tot_area = int(np.sum(area.values))
+        sum_tot_area = int(area.sum().item())
 
         reject_area = area.where(area<=min_area, drop=True)
-        sum_reject_area = int(np.sum(reject_area.values))
+        sum_reject_area = int(reject_area.sum().item())
         percent_area_reject = (sum_reject_area/sum_tot_area)
 
         accept_area = area.where(area>min_area, drop=True)
-        sum_accept_area = int(np.sum(accept_area.values))
+        sum_accept_area = int(accept_area.sum().item())
         percent_area_accept = (sum_accept_area/sum_tot_area)
 
         new_labels = new_labels.rename('labels')
@@ -215,8 +216,8 @@ class Tracker:
         print(f'minimum area: {min_area}') 
         
         keep_labels = labelprops.where(area>=min_area, drop=True)
-        keep_where = np.isin(labels_wrapped, keep_labels)
-        out_labels = xr.DataArray(np.where(keep_where==False, 0, labels_wrapped), dims=binary_images.dims, coords=binary_images.coords) #.chunk(binary_images.chunks)
+        keep_where = labels_wrapped.isin(keep_labels)
+        out_labels = xr.DataArray(xr.where(~keep_where, 0, labels_wrapped), dims=binary_images.dims, coords=binary_images.coords) #.chunk(binary_images.chunks)
 
         # Convert images to binary. All positive values == 1, otherwise == 0
         binary_labels = out_labels.where(out_labels==0, drop=False, other=1)
