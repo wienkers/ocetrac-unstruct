@@ -81,7 +81,7 @@ class Tracker:
 
         # Label objects (_and_ when using dask_image, it can additionally wrap!)
         labels_wrapped = self._label_either(binary_labels.data, structure=np.ones((3,3,3)), wrap_axes=(0,))
-        labels_wrapped = xr.DataArray(labels_wrapped, dims=binary_labels.dims, coords=binary_labels.coords).chunk(binary_images_with_mask.chunks)
+        labels_wrapped = xr.DataArray(labels_wrapped, dims=binary_labels.dims, coords=binary_labels.coords).persist()
         
         # # Wrap labels
         # grid_res = abs(self.da[self.xdim][1]-self.da[self.xdim][0])
@@ -90,12 +90,12 @@ class Tracker:
         # else:
         #     labels_wrapped = labels
         #     N_final = np.max(labels)
-        N_final = labels_wrapped.max()
+        N_final = labels_wrapped.max().values.item()
         
 
         # Final labels to DataArray
         new_labels = xr.DataArray(labels_wrapped, dims=self.da.dims, coords=self.da.coords)   
-        new_labels = new_labels.where(new_labels!=0, drop=False, other=np.nan)
+        new_labels = new_labels.where(new_labels!=0, drop=False, other=np.nan).persist()
 
 
         ## Metadata
@@ -220,7 +220,7 @@ class Tracker:
         out_labels = xr.DataArray(xr.where(~keep_where, 0, labels_wrapped), dims=binary_images.dims, coords=binary_images.coords) #.chunk(binary_images.chunks)
 
         # Convert images to binary. All positive values == 1, otherwise == 0
-        binary_labels = out_labels.where(out_labels==0, drop=False, other=1)
+        binary_labels = out_labels.where(out_labels==0, drop=False, other=1).persist()
 
         return area, min_area, binary_labels, N_initial
 
@@ -301,7 +301,7 @@ class Tracker:
         
 
         # Recalculate the total number of labels 
-        N = labels_wrapped_unique.max() #np.max(labels_wrapped_unique)
+        N = labels_wrapped_unique.max().values.item()  # Extract the value
 
         return labels_wrapped_unique, N
 
