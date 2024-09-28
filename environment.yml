@@ -1,4 +1,4 @@
-name: ocetrac-dask
+name: ocetrac-unstruct
 channels:
   - conda-forge
 dependencies:
@@ -8,6 +8,10 @@ dependencies:
   - jupyter
   - jupyterlab
   - xarray
+  - numpy
+  - numba
+  - jax
+  - jaxlib
   - scipy
   - dask
   - scikit-image
