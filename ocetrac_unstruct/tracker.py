@@ -19,6 +19,7 @@ class Tracker:
         self.timedim = timedim
         self.xdim = xdim
         self.land_mask = land_mask
+        self.resolution = resolution
         
         if ((timedim, xdim) != da.dims):
             try:
@@ -39,7 +40,7 @@ class Tracker:
         if self.neighbours_int.shape[0] != 3:
             raise ValueError('The neighbours array must have a shape of (3, ncells).')
         
-        self.n_connections = int(radius / resolution) # Number connections for effective structure element
+        self.n_connections = int(radius / self.resolution) # Number connections for effective structure element
         
         ## Construct the sparse dilation matrix
         
@@ -93,7 +94,7 @@ class Tracker:
         binary_images = self._morphological_operations()
 
         # Filter area to remove small objects
-        area, min_area, binary_images_filtered, N_initial = self._filter_area(binary_images)
+        areas, min_area, binary_images_filtered, N_initial = self._filter_area(binary_images)
 
         # Label objects -- connectivity now in time !
         labelled_global_time, N_final = self._label_unstruct_time(binary_images_filtered)
@@ -104,27 +105,31 @@ class Tracker:
         ## Metadata
 
         # Calculate Percent of total object area retained after size filtering
-        sum_tot_area = int(area.sum().item())
+        sum_tot_area = int(areas.sum().item())
 
-        reject_area = area.where(area<=min_area, drop=True)
+        reject_area = np.where(areas <= min_area, areas, 0) 
         sum_reject_area = int(reject_area.sum().item())
         percent_area_reject = (sum_reject_area/sum_tot_area)
 
-        accept_area = area.where(area>min_area, drop=True)
+        accept_area = np.where(areas > min_area, areas, 0) 
         sum_accept_area = int(accept_area.sum().item())
         percent_area_accept = (sum_accept_area/sum_tot_area)
+        
+        effective_radius_ncells = int(self.n_connections / 4) * 4
 
         final_labels = final_labels.rename('labels')
-        final_labels.attrs['inital objects identified'] = int(N_initial)
-        final_labels.attrs['final objects tracked'] = int(N_final)
-        final_labels.attrs['radius'] = self.radius
-        final_labels.attrs['size quantile threshold'] = self.min_size_quartile
-        final_labels.attrs['min area'] = min_area
-        final_labels.attrs['percent area reject'] = percent_area_reject
-        final_labels.attrs['percent area accept'] = percent_area_accept
+        final_labels.attrs['Inital Objects Identified'] = int(N_initial)
+        final_labels.attrs['Final Objects Tracked'] = int(N_final)
+        final_labels.attrs['Closing Radius'] = self.radius
+        final_labels.attrs['Resolution'] = self.resolution
+        final_labels.attrs['Effective Closing Radius (N)'] = effective_radius_ncells
+        final_labels.attrs['Size Quantile Threshold'] = self.min_size_quartile
+        final_labels.attrs['Minimum Size (N)'] = min_area
+        final_labels.attrs['Percent Area Reject'] = percent_area_reject
+        final_labels.attrs['Percent Area Accept'] = percent_area_accept
 
-        print('inital objects identified \t', int(N_initial))
-        print('final objects tracked \t', int(N_final))
+        print('Inital Time-Independent Objects Identified : \t', int(N_initial))
+        print('Final Objects Tracked through Time :\t', int(N_final))
 
         return final_labels
 
@@ -205,7 +210,7 @@ class Tracker:
         N_initial = len(areas)
         
         min_area = np.percentile(areas, self.min_size_quartile*100)
-        print(f'minimum area: {min_area}') 
+        print(f'{self.min_size_quartile*100} Percentile gives the Minimum Number of Cells : {min_area}') 
         
         def filter_area_binary(cluster_labels_0, keep_labels_0):
             keep_labels_0 = keep_labels_0[keep_labels_0>=0]
@@ -222,7 +227,7 @@ class Tracker:
                                 vectorize=True,
                                 dask='parallelized')
         
-        binary_images_filtered = binary_images_filtered.persist()
+        binary_images_filtered = binary_images_filtered #.persist()
         
 
         return areas, min_area, binary_images_filtered, N_initial
@@ -236,7 +241,7 @@ class Tracker:
         
         ## Step 1: Label all time slices -- parallel in time. Then make each label globally unique in time.
         
-        cluster_labels = self._label_union_find_unstruct(binary_images_filtered).persist()
+        cluster_labels = self._label_union_find_unstruct(binary_images_filtered) #.persist()
 
         cumsum_labels = (cluster_labels.max(dim=self.xdim) + 1).cumsum(self.timedim)
         
