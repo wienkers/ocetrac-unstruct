@@ -1,14 +1,9 @@
 import xarray as xr
 import numpy as np
-import scipy.ndimage
-from skimage.measure import regionprops_table 
-from dask_image.ndmeasure import label as label_dask
-import dask.array as dsa
-from dask import persist
 from dask.base import is_dask_collection
 import jax.numpy as jnp
 from scipy.sparse import coo_matrix, csr_matrix
-from numba import njit
+from numba import njit, prange
 
 class Tracker:
         
@@ -19,6 +14,7 @@ class Tracker:
         self.timedim = timedim
         self.xdim = xdim
         self.land_mask = land_mask
+        self.radius = radius
         self.resolution = resolution
         
         if ((timedim, xdim) != da.dims):
@@ -54,7 +50,7 @@ class Tracker:
         col_indices = col_indices[valid_mask]
 
         dilate_coo = coo_matrix((jnp.ones_like(row_indices, dtype=bool), (row_indices, col_indices)), shape=(self.neighbours_int.shape[1], self.neighbours_int.max() + 1))
-        self.dilate_sparse_4 = csr_matrix(dilate_coo)**4
+        self.dilate_sparse = csr_matrix(dilate_coo) #**4
         
         
     def track(self):
@@ -141,36 +137,33 @@ class Tracker:
         '''Converts xarray.DataArray to binary, defines structuring element, and performs morphological closing then opening.
         '''
         
-        bitmap_binary = self.da
-        exponent = int(self.n_connections / 4)
+        exponent = int(self.n_connections)
         land_mask = self.land_mask
-        dilation_matrix = self.dilate_sparse_4
+        data = self.dilate_sparse.data
+        indices = self.dilate_sparse.indices
+        indptr = self.dilate_sparse.indptr
 
         def binary_open_close(bitmap_binary):
             
-            bitmap_binary = bitmap_binary.T
-                
-            for _ in range(exponent):  bitmap_binary = dilation_matrix.dot(bitmap_binary)
+            bitmap_binary_opened = sparse_bool_power(bitmap_binary, data, indices, indptr, exponent)  # This sparse_bool_power assumes the xdim (multiplying the sparse matrix) is in dim=1
             
             # Set the land values to True (to avoid artificially eroding the shore)
-            bitmap_binary[land_mask] = True
+            bitmap_binary_opened[:, land_mask] = True
             
             ## Opening is just the negated closing of the negated image
-            bitmap_binary = ~bitmap_binary
-            for _ in range(exponent):  bitmap_binary = dilation_matrix.dot(bitmap_binary)  
-            bitmap_binary = ~bitmap_binary.T
+            bitmap_binary_closed = ~sparse_bool_power(~bitmap_binary_opened, data, indices, indptr, exponent)
             
-            return bitmap_binary
+            return bitmap_binary_closed
         
 
-        mo_binary = xr.apply_ufunc(binary_open_close, bitmap_binary,
-                                   input_core_dims=[[self.xdim]],
-                                   output_core_dims=[[self.xdim]],
-                                   output_dtypes=[bitmap_binary.dtype],
-                                   vectorize=False,
-                                   dask='parallelized')
+        mo_binary = xr.apply_ufunc(binary_open_close, self.da,
+                                    input_core_dims=[[self.xdim]],
+                                    output_core_dims=[[self.xdim]],
+                                    output_dtypes=[np.bool_],
+                                    vectorize=False,
+                                    dask='parallelized')
+        
         return mo_binary
-    
 
     
     def _filter_area(self, binary_images):
@@ -210,7 +203,7 @@ class Tracker:
         N_initial = len(areas)
         
         min_area = np.percentile(areas, self.min_size_quartile*100)
-        print(f'{self.min_size_quartile*100} Percentile gives the Minimum Number of Cells : {min_area}') 
+        print(f'{self.min_size_quartile*100}th Area Percentile gives the Minimum Number of Cells = {min_area}') 
         
         def filter_area_binary(cluster_labels_0, keep_labels_0):
             keep_labels_0 = keep_labels_0[keep_labels_0>=0]
@@ -352,9 +345,7 @@ class Tracker:
     def _label_union_find_unstruct(self, binary_images):
         '''Label all object, with no connectivity in time.
            Utilise highly efficient Unstructured Union-Find (Disjoint Set Union) Clustering Algorithm
-           Use JIT for 5x speedup.
         '''
-            
         
         def cluster_true_values(data):
             n = len(data)
@@ -400,13 +391,13 @@ class Tracker:
 
 
 ## Helper Functions for Unstructured Union-Find (Disjoint Set Union) Clustering
-@njit
+@njit(fastmath=True)
 def find(parent, i):
     if parent[i] != i:
         parent[i] = find(parent, parent[i])
     return parent[i]
 
-@njit
+@njit(fastmath=True)
 def union(parent, rank, x, y):
     root_x, root_y = find(parent, x), find(parent, y)
     if root_x != root_y:
@@ -418,3 +409,25 @@ def union(parent, rank, x, y):
             parent[root_y] = root_x
             rank[root_x] += 1
 
+
+## Helper Function for Super Fast Sparse Bool Multiply (*without the scipy+Dask Memory Leak*)
+@njit(fastmath=True, parallel=True)
+def sparse_bool_power(vec, sp_data, indices, indptr, exponent):
+    vec = vec.T
+    num_rows = indptr.size - 1
+    num_cols = vec.shape[1]
+    result = vec.copy()
+
+    for _ in range(exponent):
+        temp_result = np.zeros((num_rows, num_cols), dtype=np.bool_)
+
+        for i in prange(num_rows):
+            for j in range(indptr[i], indptr[i + 1]):
+                if sp_data[j]:
+                    for k in range(num_cols):
+                        if result[indices[j], k]:
+                            temp_result[i, k] = True
+
+        result = temp_result
+
+    return result.T
