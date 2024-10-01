@@ -3,11 +3,11 @@ import numpy as np
 from dask.base import is_dask_collection
 import jax.numpy as jnp
 from scipy.sparse import coo_matrix, csr_matrix
-from numba import njit, prange
+from numba import njit, int64, prange
 
 class Tracker:
         
-    def __init__(self, da, radius, resolution, min_size_quartile, timedim, xdim, neighbours, land_mask):
+    def __init__(self, da, scratch_dir, radius, resolution, min_size_quartile, timedim, xdim, neighbours, land_mask):
         
         self.da = da
         self.min_size_quartile = min_size_quartile
@@ -16,6 +16,7 @@ class Tracker:
         self.land_mask = land_mask
         self.radius = radius
         self.resolution = resolution
+        self.scratch_dir = scratch_dir
         
         if ((timedim, xdim) != da.dims):
             try:
@@ -32,7 +33,7 @@ class Tracker:
         
         ## Initialise the dilation array
         
-        self.neighbours_int = neighbours.astype(int).compute().data - 1 # Convert to 0-based indexing (negative values will be dropped)
+        self.neighbours_int = neighbours.astype(np.int32).compute().data - 1 # Convert to 0-based indexing (negative values will be dropped)
         if self.neighbours_int.shape[0] != 3:
             raise ValueError('The neighbours array must have a shape of (3, ncells).')
         
@@ -87,7 +88,8 @@ class Tracker:
         '''
 
         # Convert data to binary, define structuring element, and perform morphological closing then opening
-        binary_images = self._morphological_operations()
+        self._morphological_operations()  # NB: Scipy+Dask memory leak issues requires these 2 intermediary saves to clear memory...
+        binary_images = xr.open_zarr(self.scratch_dir+'/02_binary_images_temp.zarr', chunks={}).binary_images
 
         # Filter area to remove small objects
         areas, min_area, binary_images_filtered, N_initial = self._filter_area(binary_images)
@@ -163,14 +165,18 @@ class Tracker:
                                     vectorize=False,
                                     dask='parallelized')
         
-        return mo_binary
+        mo_binary.name = 'binary_images'
+        mo_binary.to_zarr(self.scratch_dir+'/02_binary_images_temp.zarr', mode='w')
+        return True
 
     
     def _filter_area(self, binary_images):
         '''Calculate area with regionprops and remove small objects'''
         
         ## Unstructured Union-Find (Disjoint Set Union) Clustering Algorithm
-        cluster_labels = self._label_union_find_unstruct(binary_images).persist()
+        self._label_union_find_unstruct(binary_images, '/02_cluster_labels_1_temp.zarr')
+        # NB: Scipy+Dask memory leak issues requires these 2 intermediary saves to clear memory...
+        cluster_labels = xr.open_zarr(self.scratch_dir+'/02_cluster_labels_1_temp.zarr', chunks={}).cluster_labels
         
         max_label = cluster_labels.max().compute().data+1
         
@@ -234,13 +240,16 @@ class Tracker:
         
         ## Step 1: Label all time slices -- parallel in time. Then make each label globally unique in time.
         
-        cluster_labels = self._label_union_find_unstruct(binary_images_filtered) #.persist()
+        self._label_union_find_unstruct(binary_images_filtered, '/02_cluster_labels_2_temp.zarr')
+        # NB: Scipy+Dask memory leak issues requires these 2 intermediary saves to clear memory...
+        cluster_labels = xr.open_zarr(self.scratch_dir+'/02_cluster_labels_2_temp.zarr', chunks={}).cluster_labels
 
         cumsum_labels = (cluster_labels.max(dim=self.xdim) + 1).cumsum(self.timedim)
         
         min_int64 = np.iinfo(np.int64).min
         cluster_labels_nan = xr.where(cluster_labels<0, min_int64, cluster_labels)  # Otherwise the -1 labels get added to !!!
         cluster_labels_unique = cluster_labels_nan + cumsum_labels
+        cluster_labels_unique = cluster_labels_unique.persist()
         
         
         ## Step 2: Go again (parallel in time) but now checking just for overlap with previous and next time slice.
@@ -315,26 +324,23 @@ class Tracker:
         ## Step 4: Replace all labels in cluster_labels_unique that match the equivalent_labels with the list index:  This is the new/final label.
         
         # Create a dictionary to map labels to the new cluster indices
-        label_to_cluster_index = {}
+        min_int32 = np.iinfo(np.int32).min
+        label_to_cluster_index_array = np.full(cluster_labels_unique.max().compute().data + 1, min_int32, dtype=np.int32)
         for index, cluster in enumerate(equivalent_labels):
             for label in cluster:
-                label_to_cluster_index[label] = index
+                label_to_cluster_index_array[label] = np.int32(index) # Because these are the connected labels, there are many fewer!
         
         # Create a vectorized function to replace labels with cluster indices
-        def replace_labels(labels):
-            return np.vectorize(label_to_cluster_index.get)(labels, min_int64)
-        
         relabeled_unique = xr.apply_ufunc(
-            replace_labels,
+            lambda x: np.where(x < 0, min_int32, label_to_cluster_index_array[np.maximum(0,x)]),
             cluster_labels_unique,
             input_core_dims=[[self.xdim]],
             output_core_dims=[[self.xdim]],
-            vectorize=True,
             dask="parallelized",
-            output_dtypes=[np.int64]
+            output_dtypes=[np.int32]
         )
-        
-        relabeled_unique = relabeled_unique.persist()
+                
+        relabeled_unique = relabeled_unique #.persist()
         
         N_final = len(equivalent_labels)
         
@@ -342,62 +348,67 @@ class Tracker:
 
     
     
-    def _label_union_find_unstruct(self, binary_images):
+    def _label_union_find_unstruct(self, binary_images, temp_filename):
         '''Label all object, with no connectivity in time.
            Utilise highly efficient Unstructured Union-Find (Disjoint Set Union) Clustering Algorithm
         '''
         
-        def cluster_true_values(data):
-            n = len(data)
-            parent = np.arange(n)
-            rank = np.zeros(n, dtype=np.int32)
+        neighbours_int = self.neighbours_int
 
-            for i in range(n):
-                if data[i]:
-                    for j in range(3):
-                        neighbor = self.neighbours_int[j, i]
-                        if neighbor != -1 and data[neighbor]:
-                            union(parent, rank, i, neighbor)
-
-            cluster_labels = np.full(n, -1, dtype=np.int32)
-            cluster_count = 0
+        
+        def cluster_true_values(data_block):
+            n = data_block.shape[-1]
+            cluster_labels = -1 * np.ones_like(data_block, dtype=np.int64)
+            parent = np.arange(n, dtype=np.int64)
+            rank = np.zeros(n, dtype=np.int64)
             root_to_cluster = {}
+            cluster_count = 0
 
-            for i in range(n):
-                if data[i]:
-                    root = find(parent, i)
-                    if root not in root_to_cluster:
-                        root_to_cluster[root] = cluster_count
-                        cluster_count += 1
-                    cluster_labels[i] = root_to_cluster[root]
+            for t in range(data_block.shape[0]):
+                data = data_block[t]
+                parent[:] = np.arange(n, dtype=np.int64)
+                rank[:] = 0
+                root_to_cluster.clear()
+                cluster_count = 0
 
-            return cluster_labels #, cluster_count
+                for i in data.nonzero()[0]:
+                    for neighbor in neighbours_int[:, i]:
+                        if neighbor != -1 and data[neighbor]:
+                            root = union_find(parent, rank, i, neighbor)
+                            if root not in root_to_cluster:
+                                root_to_cluster[root] = cluster_count
+                                cluster_count += 1
+                            cluster_labels[t, i] = root_to_cluster[root]
+
+            return cluster_labels
         
         
         ## Label time-independent in 2D (i.e. no time connectivity!)
-        binary_images_mask = xr.where(self.land_mask, False, binary_images)  # Mask land
+        binary_images_mask = binary_images.where(~self.land_mask, other=True).persist()  # Mask land
         
         cluster_labels = xr.apply_ufunc(cluster_true_values, 
                                 binary_images_mask, 
                                 input_core_dims=[[self.xdim]],
                                 output_core_dims=[[self.xdim]],
                                 output_dtypes=[np.int64],
-                                vectorize=True,
+                                vectorize=False,
                                 dask='parallelized')
         
-        cluster_labels = cluster_labels # .persist()  # label = -1 if False
+        # label = -1 if False
+        cluster_labels.name = 'cluster_labels'
+        cluster_labels.to_zarr(self.scratch_dir+temp_filename, mode='w') 
         
-        return cluster_labels
+        return True
 
 
 ## Helper Functions for Unstructured Union-Find (Disjoint Set Union) Clustering
-@njit(fastmath=True)
+@njit(fastmath=True, parallel=True)
 def find(parent, i):
     if parent[i] != i:
         parent[i] = find(parent, parent[i])
     return parent[i]
 
-@njit(fastmath=True)
+@njit(fastmath=True, parallel=True)
 def union(parent, rank, x, y):
     root_x, root_y = find(parent, x), find(parent, y)
     if root_x != root_y:
@@ -408,6 +419,29 @@ def union(parent, rank, x, y):
         else:
             parent[root_y] = root_x
             rank[root_x] += 1
+
+
+@njit(int64(int64[:], int64[:], int64, int64), fastmath=True)
+def union_find(parent, rank, x, y):
+    root_x = x
+    while parent[root_x] != root_x:
+        root_x = parent[root_x]
+        
+    root_y = y
+    while parent[root_y] != root_y:
+        root_y = parent[root_y]
+        
+    if root_x != root_y:
+        if rank[root_x] < rank[root_y]:
+            parent[root_x] = root_y
+        elif rank[root_x] > rank[root_y]:
+            parent[root_y] = root_x
+        else:
+            parent[root_y] = root_x
+            rank[root_x] += 1
+            
+    return root_x
+
 
 
 ## Helper Function for Super Fast Sparse Bool Multiply (*without the scipy+Dask Memory Leak*)
