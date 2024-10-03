@@ -1,9 +1,11 @@
 import xarray as xr
 import numpy as np
 from dask.base import is_dask_collection
+import dask.array as dsa
 import jax.numpy as jnp
 from scipy.sparse import coo_matrix, csr_matrix
-from numba import njit, int64, prange
+from scipy.sparse.csgraph import connected_components
+from numba import njit, int64, int32, prange
 
 class Tracker:
         
@@ -90,15 +92,18 @@ class Tracker:
         # Convert data to binary, define structuring element, and perform morphological closing then opening
         self._morphological_operations()  # NB: Scipy+Dask memory leak issues requires these 2 intermediary saves to clear memory...
         binary_images = xr.open_zarr(self.scratch_dir+'/02_binary_images_temp.zarr', chunks={}).binary_images
-
+        print('Done with Morphological Operations')
+        
         # Filter area to remove small objects
-        areas, min_area, binary_images_filtered, N_initial = self._filter_area(binary_images)
+        areas, min_area, N_initial = self._filter_area(binary_images)
+        binary_images_filtered = xr.open_zarr(self.scratch_dir+'/02_binary_images_filtered_temp.zarr', chunks={}).binary_images_filtered
+        print('Done with Area Filtering')
 
         # Label objects -- connectivity now in time !
-        labelled_global_time, N_final = self._label_unstruct_time(binary_images_filtered)
+        final_labels, N_final = self._label_unstruct_time(binary_images_filtered)
+        print('Done with Time-Connected Labeling')
 
-        final_labels = xr.where(labelled_global_time<0, np.nan, labelled_global_time)  # Set -1 labels to NaN
-
+        #final_labels = xr.where(labelled_global_time<0, np.nan, labelled_global_time)  # Set -1 labels to NaN  ## Don't, because it converts to float64...
 
         ## Metadata
 
@@ -128,6 +133,9 @@ class Tracker:
 
         print('Inital Time-Independent Objects Identified : \t', int(N_initial))
         print('Final Objects Tracked through Time :\t', int(N_final))
+        
+        final_labels.to_zarr(self.scratch_dir+'/02_final_labels.zarr', mode='w')
+        final_labels = xr.open_zarr(self.scratch_dir+'/02_final_labels.zarr', chunks={})
 
         return final_labels
 
@@ -185,7 +193,7 @@ class Tracker:
         
         def count_cluster_sizes(cluster_labels):
             unique, counts = np.unique(cluster_labels[cluster_labels != -1], return_counts=True)
-            padded_sizes = np.zeros(max_label, dtype=np.int64)
+            padded_sizes = np.zeros(max_label, dtype=np.int32)
             padded_sizes[:len(counts)] = counts
             return padded_sizes  # ith element corresponds to label=i
         
@@ -194,14 +202,15 @@ class Tracker:
                                 input_core_dims=[[self.xdim]],
                                 output_core_dims=[['labels']],
                                 output_sizes={'labels': max_label}, 
-                                output_dtypes=[np.int64],
+                                output_dtypes=[np.int32],
                                 vectorize=True,
                                 dask='parallelized')
         
-        cluster_sizes = cluster_sizes.compute()
+        cluster_sizes = cluster_sizes.persist()
         
-        areas = cluster_sizes.values.flatten()
-        areas = areas[areas>1]
+        cluster_sizes_filtered_dask = cluster_sizes.where(cluster_sizes > 3).data
+        cluster_areas_mask = dsa.isfinite(cluster_sizes_filtered_dask)
+        areas = cluster_sizes_filtered_dask[cluster_areas_mask].compute()
 
 
         ## Filter small areas: 
@@ -226,10 +235,12 @@ class Tracker:
                                 vectorize=True,
                                 dask='parallelized')
         
-        binary_images_filtered = binary_images_filtered #.persist()
+        binary_images_filtered.name = 'binary_images_filtered'
+        binary_images_filtered.attrs['min_area'] = min_area
+        binary_images_filtered.attrs['N_initial'] = N_initial
+        binary_images_filtered.to_zarr(self.scratch_dir+'/02_binary_images_filtered_temp.zarr', mode='w') 
         
-
-        return areas, min_area, binary_images_filtered, N_initial
+        return areas, min_area, N_initial  # binary_images_filtered
     
     
         
@@ -242,9 +253,9 @@ class Tracker:
         
         self._label_union_find_unstruct(binary_images_filtered, '/02_cluster_labels_2_temp.zarr')
         # NB: Scipy+Dask memory leak issues requires these 2 intermediary saves to clear memory...
-        cluster_labels = xr.open_zarr(self.scratch_dir+'/02_cluster_labels_2_temp.zarr', chunks={}).cluster_labels
+        cluster_labels = xr.open_zarr(self.scratch_dir+'/02_cluster_labels_2_temp.zarr', chunks={'time': 4}).cluster_labels
 
-        cumsum_labels = (cluster_labels.max(dim=self.xdim) + 1).cumsum(self.timedim)
+        cumsum_labels = (cluster_labels.max(dim=self.xdim) + 1).cumsum(self.timedim).persist()
         
         min_int64 = np.iinfo(np.int64).min
         cluster_labels_nan = xr.where(cluster_labels<0, min_int64, cluster_labels)  # Otherwise the -1 labels get added to !!!
@@ -267,7 +278,7 @@ class Tracker:
             pairs_all = np.sort(pairs_all, axis=1)
             pairs_unique = np.unique(pairs_all, axis=0)
             
-            return pairs_unique.astype(np.int64)
+            return pairs_unique.astype(np.int32)
         
         overlap_pairs = xr.apply_ufunc(
                             check_overlap,
@@ -291,32 +302,27 @@ class Tracker:
             # Get unique labels from the overlap pairs
             labels = np.unique(overlap_pairs_all)
             
-            # Initialize disjoint set data structure
-            n = len(labels)
-            parent = np.arange(n)
-            rank = np.zeros(n, dtype=int)
-            
-            # Map labels to indices in the disjoint set
+            # Create a mapping from labels to indices
             label_to_index = {label: index for index, label in enumerate(labels)}
             
-            # Perform union-find on the overlap pairs
-            for pair in overlap_pairs_all:
-                x = label_to_index[pair[0]]
-                y = label_to_index[pair[1]]
-                union(parent, rank, x, y)
+            # Convert overlap pairs to indices
+            overlap_pairs_indices = np.array([(label_to_index[pair[0]], label_to_index[pair[1]]) for pair in overlap_pairs_all])
             
-            # Find the root label for each label
-            root_labels = [find(parent, label_to_index[label]) for label in labels]
+            # Create a sparse matrix representation of the graph
+            n = len(labels)
+            row_indices, col_indices = overlap_pairs_indices.T
+            data = np.ones(len(overlap_pairs_indices))
+            graph = csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
             
-            # Group labels by their root label
-            clusters = {}
-            for label, root in zip(labels, root_labels):
-                root_label = labels[root]
-                if root_label not in clusters:
-                    clusters[root_label] = []
-                clusters[root_label].append(label)
+            # Find connected components
+            num_components, component_labels = connected_components(csgraph=graph, directed=False, return_labels=True)
             
-            return list(clusters.values())
+            # Group labels by their component label
+            clusters = [[] for _ in range(num_components)]
+            for label, component_label in zip(labels, component_labels):
+                clusters[component_label].append(label)
+            
+            return clusters
         
         equivalent_labels = cluster_time_pairs(overlap_pairs_all)
         
@@ -325,23 +331,32 @@ class Tracker:
         
         # Create a dictionary to map labels to the new cluster indices
         min_int32 = np.iinfo(np.int32).min
-        label_to_cluster_index_array = np.full(cluster_labels_unique.max().compute().data + 1, min_int32, dtype=np.int32)
+        max_label = cluster_labels_unique.max().compute().data
+        label_to_cluster_index_array = np.full(max_label + 1, min_int32, dtype=np.int32)
+
+        # Fill the lookup array with cluster indices
         for index, cluster in enumerate(equivalent_labels):
             for label in cluster:
                 label_to_cluster_index_array[label] = np.int32(index) # Because these are the connected labels, there are many fewer!
         
-        # Create a vectorized function to replace labels with cluster indices
+        # NB: **Need to pass da into apply_ufunc, otherwise it doesn't manage the memory correctly with large shared-mem numpy arrays !!!
+        label_to_cluster_index_array_da = xr.DataArray(label_to_cluster_index_array, dims='label', coords={'label': np.arange(max_label + 1)})
+        
+        def map_labels_to_indices(block, label_to_cluster_index_array):
+            mask = block >= 0
+            block[mask] = label_to_cluster_index_array[block[mask]]
+            return block
+        
         relabeled_unique = xr.apply_ufunc(
-            lambda x: np.where(x < 0, min_int32, label_to_cluster_index_array[np.maximum(0,x)]),
-            cluster_labels_unique,
-            input_core_dims=[[self.xdim]],
+            map_labels_to_indices,
+            cluster_labels_unique, 
+            label_to_cluster_index_array_da,
+            input_core_dims=[[self.xdim],['label']],
             output_core_dims=[[self.xdim]],
             dask="parallelized",
             output_dtypes=[np.int32]
         )
-                
-        relabeled_unique = relabeled_unique #.persist()
-        
+
         N_final = len(equivalent_labels)
         
         return relabeled_unique, N_final
@@ -358,15 +373,15 @@ class Tracker:
         
         def cluster_true_values(data_block):
             n = data_block.shape[-1]
-            cluster_labels = -1 * np.ones_like(data_block, dtype=np.int64)
-            parent = np.arange(n, dtype=np.int64)
-            rank = np.zeros(n, dtype=np.int64)
+            cluster_labels = -1 * np.ones_like(data_block, dtype=np.int32)
+            parent = np.arange(n, dtype=np.int32)
+            rank = np.zeros(n, dtype=np.int32)
             root_to_cluster = {}
-            cluster_count = 0
+            cluster_count = np.int32(0)
 
             for t in range(data_block.shape[0]):
                 data = data_block[t]
-                parent[:] = np.arange(n, dtype=np.int64)
+                parent[:] = np.arange(n, dtype=np.int32)
                 rank[:] = 0
                 root_to_cluster.clear()
                 cluster_count = 0
@@ -374,7 +389,7 @@ class Tracker:
                 for i in data.nonzero()[0]:
                     for neighbor in neighbours_int[:, i]:
                         if neighbor != -1 and data[neighbor]:
-                            root = union_find(parent, rank, i, neighbor)
+                            root = union_find(parent, rank, np.int32(i), neighbor)
                             if root not in root_to_cluster:
                                 root_to_cluster[root] = cluster_count
                                 cluster_count += 1
@@ -390,7 +405,7 @@ class Tracker:
                                 binary_images_mask, 
                                 input_core_dims=[[self.xdim]],
                                 output_core_dims=[[self.xdim]],
-                                output_dtypes=[np.int64],
+                                output_dtypes=[np.int32],
                                 vectorize=False,
                                 dask='parallelized')
         
@@ -402,13 +417,13 @@ class Tracker:
 
 
 ## Helper Functions for Unstructured Union-Find (Disjoint Set Union) Clustering
-@njit(fastmath=True, parallel=True)
+@njit(fastmath=True)
 def find(parent, i):
     if parent[i] != i:
         parent[i] = find(parent, parent[i])
     return parent[i]
 
-@njit(fastmath=True, parallel=True)
+@njit(fastmath=True)
 def union(parent, rank, x, y):
     root_x, root_y = find(parent, x), find(parent, y)
     if root_x != root_y:
@@ -421,7 +436,7 @@ def union(parent, rank, x, y):
             rank[root_x] += 1
 
 
-@njit(int64(int64[:], int64[:], int64, int64), fastmath=True)
+@njit(int32(int32[:], int32[:], int32, int32), fastmath=True)
 def union_find(parent, rank, x, y):
     root_x = x
     while parent[root_x] != root_x:
